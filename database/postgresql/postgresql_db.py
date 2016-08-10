@@ -29,6 +29,13 @@ options:
       - name of the database to add or remove
     required: true
     default: null
+  login_database:
+    description:
+      - The name of the database initially used to login the first time. This is especially handy for databases
+        like redshift where "dev" is the default and the "postgres" database does not exist.
+    required: false
+    default: postgres
+    version_added: 2.2
   login_user:
     description:
       - The username used to authenticate with
@@ -85,6 +92,12 @@ options:
     required: false
     default: present
     choices: [ "present", "absent" ]
+  is_redshift:
+    description:
+      - Flag to specify whether you are connecting to a redshift cluster or not.
+    required: false
+    default: False
+    version_added: 2.2
 notes:
    - The default authentication assumes that you are either logging in as or sudo'ing to the C(postgres) account on the host.
    - This module uses I(psycopg2), a Python PostgreSQL database adapter. You must ensure that psycopg2 is installed on
@@ -135,6 +148,15 @@ def get_encoding_id(cursor, encoding):
     cursor.execute(query, {'encoding': encoding})
     return cursor.fetchone()['encoding_id']
 
+def get_db_info_redshift(cursor, db):
+    query = """
+    SELECT tableowner AS owner
+    FROM pg_tables
+    WHERE tablename = %(db)s
+    """
+    cursor.execute(query, {'db': db})
+    return cursor.fetchone()
+
 def get_db_info(cursor, db):
     query = """
     SELECT rolname AS owner,
@@ -159,7 +181,7 @@ def db_delete(cursor, db):
     else:
         return False
 
-def db_create(cursor, db, owner, template, encoding, lc_collate, lc_ctype):
+def db_create(cursor, db, owner, template, encoding, lc_collate, lc_ctype, is_redshift):
     params = dict(enc=encoding, collate=lc_collate, ctype=lc_ctype)
     if not db_exists(cursor, db):
         query_fragments = ['CREATE DATABASE %s' % pg_quote_identifier(db, 'database')]
@@ -177,41 +199,54 @@ def db_create(cursor, db, owner, template, encoding, lc_collate, lc_ctype):
         cursor.execute(query, params)
         return True
     else:
-        db_info = get_db_info(cursor, db)
-        if (encoding and
-            get_encoding_id(cursor, encoding) != db_info['encoding_id']):
-            raise NotSupportedError(
-                'Changing database encoding is not supported. '
-                'Current encoding: %s' % db_info['encoding']
-            )
-        elif lc_collate and lc_collate != db_info['lc_collate']:
-            raise NotSupportedError(
-                'Changing LC_COLLATE is not supported. '
-                'Current LC_COLLATE: %s' % db_info['lc_collate']
-            )
-        elif lc_ctype and lc_ctype != db_info['lc_ctype']:
-            raise NotSupportedError(
-                'Changing LC_CTYPE is not supported.'
-                'Current LC_CTYPE: %s' % db_info['lc_ctype']
-            )
-        elif owner and owner != db_info['owner']:
+        # Redshift does not support locale-specific or user-defined collation sequences
+        if is_redshift:
+            db_info = get_db_info_redshift(cursor, db)
+        else:
+            db_info = get_db_info(cursor, db)
+
+        if not is_redshift:
+            if (encoding and
+                get_encoding_id(cursor, encoding) != db_info['encoding_id']):
+                raise NotSupportedError(
+                    'Changing database encoding is not supported. '
+                    'Current encoding: %s' % db_info['encoding']
+                )
+            elif lc_collate and lc_collate != db_info['lc_collate']:
+                raise NotSupportedError(
+                    'Changing LC_COLLATE is not supported. '
+                    'Current LC_COLLATE: %s' % db_info['lc_collate']
+                )
+            elif lc_ctype and lc_ctype != db_info['lc_ctype']:
+                raise NotSupportedError(
+                    'Changing LC_CTYPE is not supported.'
+                    'Current LC_CTYPE: %s' % db_info['lc_ctype']
+                )
+
+        if owner and owner != db_info['owner']:
             return set_owner(cursor, db, owner)
         else:
             return False
 
-def db_matches(cursor, db, owner, template, encoding, lc_collate, lc_ctype):
+def db_matches(cursor, db, owner, template, encoding, lc_collate, lc_ctype, is_redshift):
     if not db_exists(cursor, db):
        return False
     else:
-        db_info = get_db_info(cursor, db)
-        if (encoding and
-            get_encoding_id(cursor, encoding) != db_info['encoding_id']):
-            return False
-        elif lc_collate and lc_collate != db_info['lc_collate']:
-            return False
-        elif lc_ctype and lc_ctype != db_info['lc_ctype']:
-            return False
-        elif owner and owner != db_info['owner']:
+        if is_redshift:
+            db_info = get_db_info_redshift(cursor, db)
+        else:
+            db_info = get_db_info(cursor, db)
+
+        if not is_redshift:
+            if (encoding and
+                get_encoding_id(cursor, encoding) != db_info['encoding_id']):
+                return False
+            elif lc_collate and lc_collate != db_info['lc_collate']:
+                return False
+            elif lc_ctype and lc_ctype != db_info['lc_ctype']:
+                return False
+
+        if owner and owner != db_info['owner']:
             return False
         else:
             return True
@@ -223,6 +258,7 @@ def db_matches(cursor, db, owner, template, encoding, lc_collate, lc_ctype):
 def main():
     module = AnsibleModule(
         argument_spec=dict(
+            login_database=dict(default="postgres"),
             login_user=dict(default="postgres"),
             login_password=dict(default=""),
             login_host=dict(default=""),
@@ -234,6 +270,7 @@ def main():
             encoding=dict(default=""),
             lc_collate=dict(default=""),
             lc_ctype=dict(default=""),
+            is_redshift=dict(default=False),
             state=dict(default="present", choices=["absent", "present"]),
         ),
         supports_check_mode = True
@@ -250,6 +287,8 @@ def main():
     lc_collate = module.params["lc_collate"]
     lc_ctype = module.params["lc_ctype"]
     state = module.params["state"]
+    login_database = module.params["login_database"]
+    is_redshift = module.params["is_redshift"]
     changed = False
 
     # To use defaults values, keyword arguments must be absent, so
@@ -270,7 +309,7 @@ def main():
         kw["host"] = module.params["login_unix_socket"]
 
     try:
-        db_connection = psycopg2.connect(database="postgres", **kw)
+        db_connection = psycopg2.connect(database=login_database, **kw)
         # Enable autocommit so we can create databases
         if psycopg2.__version__ >= '2.4.2':
             db_connection.autocommit = True
@@ -290,7 +329,7 @@ def main():
                 changed = not db_exists(cursor, db)
             elif state == "present":
                 changed = not db_matches(cursor, db, owner, template, encoding,
-                                         lc_collate, lc_ctype)
+                                         lc_collate, lc_ctype, is_redshift)
             module.exit_json(changed=changed,db=db)
 
         if state == "absent":
@@ -303,7 +342,7 @@ def main():
         elif state == "present":
             try:
                 changed = db_create(cursor, db, owner, template, encoding,
-                                lc_collate, lc_ctype)
+                                lc_collate, lc_ctype, is_redshift)
             except SQLParseError:
                 e = get_exception()
                 module.fail_json(msg=str(e))
@@ -311,7 +350,7 @@ def main():
         e = get_exception()
         module.fail_json(msg=str(e))
     except SystemExit:
-        # Avoid catching this on Python 2.4 
+        # Avoid catching this on Python 2.4
         raise
     except Exception:
         e = get_exception()
